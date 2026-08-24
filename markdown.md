@@ -55,11 +55,10 @@ streaming-ids/
 │   ├── rules.json                    ✅ built — six attack signatures, validated (see results below)
 │   └── validate_rules.py             ✅ built, fixed and run 2026-08-24 — offline rule scorer
 ├── evaluation/
-│   └── evaluate_accuracy.py          ⬜ not started — reads `detections` + `traffic_counts`, computes
-│                                        precision/recall/F1 per attack type + overall false-positive
-│                                        rate for the capstone report
+│   └── evaluate_accuracy.py          ✅ built — metric math verified against known-truth fixture
+│                                        (18/18); SQL layer unverified until live ClickHouse
 ├── clickhouse-init/
-│   └── 01-create-database.sql        ⬜ MISSING — docker-compose.yml mounts this, file does not exist
+│   └── 01-create-database.sql        ✅ built — creates the `ids` database on first boot only
 ├── superset/
 │   └── Dockerfile                     ✅ built (lightweight `FROM apache/superset:latest` + clickhouse-connect)
 ├── docker-compose.yml                 ✅ built, kafka+clickhouse+superset untested end-to-end
@@ -282,7 +281,7 @@ All 7 assertions passed: both buckets counted correctly and separately; 400 vali
 
 1. ~~**Superset conflict.**~~ **Resolved.** Went with the lightweight wrapper Dockerfile (`FROM apache/superset:latest` + `pip install clickhouse-connect`) rather than touching the separate, unrelated full-source Superset build that already exists locally. `docker-compose.yml`'s `superset` service already points at `build: ./superset`, so this drops in with no compose changes needed.
 2. ~~**`rules_engine.py` missing from disk.**~~ **Resolved 2026-08-24** — written and tested against a real Spark session.
-3. **`clickhouse-init/01-create-database.sql` does not exist.** `docker-compose.yml` mounts it to auto-create the `ids` database on ClickHouse's first boot. In practice `clickhouse_writer.ensure_tables()` also issues `CREATE DATABASE IF NOT EXISTS`, so this may be redundant — but as written, the compose mount points at a missing path.
+3. ~~**`clickhouse-init/01-create-database.sql` does not exist.**~~ **Resolved 2026-08-24** — written. Creates the database only; the tables stay owned by `clickhouse_writer.ensure_tables()` so there is one source of truth for DDL. Note it runs on **first boot only** (empty data volume), so `docker compose down -v` is what re-triggers it.
 4. ~~**Malformed-record filter never fired.**~~ **Resolved 2026-08-24** — `from_json` returns an all-null struct, not a null struct. Replaced with required-field classification, split into transmission vs generation buckets. See above.
 5. **Nothing in the pipeline has been run against real Docker containers yet.** Every component has been tested in isolation (real Spark for the rule engine, schema, and malformed classification; mocks/dry-run elsewhere) — never against a live Kafka/ClickHouse stack.
 6. ~~**Stale credentials in `certs/`.**~~ **Resolved 2026-08-24** — `certs/` deleted, and `.gitignore` now blocks `*.pem`/`*.key`/`*.p12`/`*.pfx`/`*.crt`/`certs/`. No `git init` had happened, so the keys are absent from history entirely.
@@ -293,7 +292,29 @@ All 7 assertions passed: both buckets counted correctly and separately; 400 vali
 2. ~~Write `rules_engine.py`.~~ Done and tested.
 3. ~~Get `validate_rules.py` running and score `rules.json`.~~ Done — results above.
 4. ~~Delete `certs/*.pem`; write `.gitignore`.~~ Done 2026-08-24 — `certs/` removed, `.gitignore` written and verified with `git check-ignore` against a replica tree. The repo has not been `git init`'d yet, so the keys never entered any commit history.
-5. Create `clickhouse-init/01-create-database.sql`, or drop the mount from `docker-compose.yml`.
-6. Run `docker compose up -d` on the laptop and confirm all services come up healthy — including a real `insert_df()` round-trip for `clickhouse_writer.py`.
-7. `evaluate_accuracy.py` — reads `detections` + `traffic_counts` from ClickHouse, computes precision/recall/F1 per attack type and overall false-positive rate, for the capstone report. **Must apply `schema.REAL_TRAFFIC_ONLY_SQL` to every `traffic_counts` aggregate** so the malformed pseudo-labels don't enter a denominator. Should also report the malformed rate itself, split by bucket — it's a pipeline-health number worth having in the writeup.
-8. Run the complete Docker-backed pipeline end-to-end and verify Kafka → Spark → ClickHouse, including observed detection latency against the <2s target.
+5. ~~Create `clickhouse-init/01-create-database.sql`.~~ Done.
+6. ~~`evaluate_accuracy.py`.~~ Done — see below.
+7. **Run `docker compose up -d` on the laptop** and confirm all services come up healthy — including a real `insert_df()` round-trip for `clickhouse_writer.py`. Watch Superset's first-boot bootstrap chain, the most version-sensitive part.
+8. **Run the complete pipeline end-to-end** and verify Kafka → Spark → ClickHouse, then run `evaluate_accuracy.py` against the result. This is the first moment the `<2s` latency claim becomes a measured number rather than a design target.
+9. Write the technical README (what it is, prerequisites, how to run). `markdown.md` stays as the progress log — deliberately kept separate so it can travel with the repo as working context across machines.
+
+## `evaluate_accuracy.py` — built, math verified
+
+The capstone accuracy report. Distinct from `validate_rules.py`: that scores `rules.json` offline straight from the generator; this scores the **live pipeline**, where everything measured has survived serialization, Kafka, Spark parsing, rule evaluation and a ClickHouse insert. If the two disagree, the gap *is* the pipeline — worth investigating rather than averaging away.
+
+**What it reports**
+
+- Overall confusion matrix (TP / FN / FP / TN), precision, recall, F1, accuracy
+- **False-positive rate** — the number that needs `traffic_counts`, since the TN count exists nowhere else
+- Per-attack-type recall, precision and F1. Per-type precision comes from `arrayJoin(matched_attack_types)`, so a row flagged as the *wrong* attack type counts against that type — the honest reading, and the one that exposes a noisy rule
+- Observed detection latency vs the 2s target: mean/p50/p95/p99/max and the share under target
+- Malformed rate, split into the transmission and generation buckets
+- **Integrity cross-checks** between the two tables — every attack record in `traffic_counts` must have a matching row in `detections`. Catches dropped rows or a report run mid-stream, which otherwise produce plausible-looking but wrong metrics
+
+**Structure.** The SQL layer and the arithmetic are separate: `compute_report()` is pure, takes plain row tuples, and has no database or pandas dependency. That is what makes the math testable without a live ClickHouse.
+
+**Flags:** `--json` and `--markdown` write report-ready output (the markdown emits tables that paste straight into the writeup); `--show-sql` prints the queries without connecting; `--self-test` runs the arithmetic against a fixture.
+
+**Verification status.** `--self-test` feeds `compute_report()` a fixture captured from a real 3-batch pipeline run where the answers are known independently (TP=2206, FN=26, FP=250, 42,408 normal records seen) — **18/18 assertions pass**, covering every derived metric including the noisiest rule's 64.1% precision. Empty-database and zero-division paths render without crashing. **The SQL itself is unverified** — no ClickHouse has run these queries yet. `arrayJoin` and the `LIKE '\_\_%\_\_'` escaping are the two things to watch on first live run.
+
+**Exit codes:** `0` clean · `2` cannot reach ClickHouse · `3` tables empty (job hasn't written yet) · `4` an integrity check failed.
