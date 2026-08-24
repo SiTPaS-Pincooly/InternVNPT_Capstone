@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------------------
+# Streaming IDS — .gitignore
+#
+# Only patterns that can actually occur in THIS project. Docker data lives in
+# named volumes (kafka-data, clickhouse-data, superset-data), not bind mounts,
+# so no container state ever lands in the working tree and none is listed here.
+# ---------------------------------------------------------------------------
+
+# --- Credentials and secrets -----------------------------------------------
+# The project previously carried Azure VM SSH keys in certs/. The VMs are gone
+# and the keys deleted; these patterns exist so a stray key can never be
+# committed by accident. Anything matching here is unrecoverable once pushed.
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+certs/
+
+# config.py reads every setting from an environment variable. The moment you
+# override CLICKHOUSE_PASSWORD for a non-local deployment, it belongs in a
+# .env file — which must never be committed.
+.env
+.env.*
+!.env.example
+
+# --- Spark Structured Streaming --------------------------------------------
+# CHECKPOINT_LOCATION (config.py, default ./_checkpoints/streaming_job).
+# This holds committed Kafka offsets and streaming state. Committing it is
+# actively harmful: a clone would resume from another machine's offsets, and
+# a stale checkpoint whose schema no longer matches makes the job refuse to
+# start. Delete the directory to replay a topic from scratch.
+_checkpoints/
+checkpoint/
+checkpoints/
+
+# Spark's local Derby metastore and warehouse, created in the working
+# directory by any local[] session — rules_engine.py's self-test and
+# validate_rules.py both produce these.
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Spark write staging and per-file checksums
+.spark-staging*/
+*.crc
+_SUCCESS
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / tooling caches
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Run output ------------------------------------------------------------
+# Logs from streaming_job.py and container output captured to file.
+*.log
+logs/
+
+# Ad-hoc exports. evaluate_accuracy.py results belong in the report, not in
+# git — regenerate them from ClickHouse instead of committing a snapshot.
+/output/
+/results/
+*.parquet
+
+# --- Editors ---------------------------------------------------------------
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# --- OS --------------------------------------------------------------------
+# Windows (development machine)
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# macOS (in case the repo is opened or marked up elsewhere)
+.DS_Store
+._*

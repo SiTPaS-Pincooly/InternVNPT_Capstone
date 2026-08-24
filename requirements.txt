@@ -1,0 +1,7 @@
+numpy>=1.24
+confluent-kafka>=2.3
+orjson>=3.9
+pyspark
+pandas
+pyarrow>=18.0.0
+clickhouse-connect

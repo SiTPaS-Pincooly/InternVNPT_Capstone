@@ -1,0 +1,67 @@
+[
+  {
+    "rule_id": "ddos_flood",
+    "attack_type": "ddos",
+    "severity": "critical",
+    "description": "Flood of half-open connections: very high connection count, high SYN error rate, near-zero payload",
+    "conditions": [
+      {"field": "count", "op": ">=", "value": 150},
+      {"field": "serror_rate", "op": ">=", "value": 0.7},
+      {"field": "dst_bytes", "op": "<=", "value": 20}
+    ]
+  },
+  {
+    "rule_id": "port_scan_sweep",
+    "attack_type": "port_scan",
+    "severity": "medium",
+    "description": "Many distinct services probed briefly: low same-service rate, high diff-service rate, elevated reject/error rate",
+    "conditions": [
+      {"field": "diff_srv_rate", "op": ">=", "value": 0.5},
+      {"field": "same_srv_rate", "op": "<=", "value": 0.15},
+      {"field": "rerror_rate", "op": ">=", "value": 0.4}
+    ]
+  },
+  {
+    "rule_id": "brute_force_login",
+    "attack_type": "brute_force",
+    "severity": "high",
+    "description": "Repeated authentication failures against one service in a short window",
+    "conditions": [
+      {"field": "num_failed_logins", "op": ">=", "value": 2},
+      {"field": "count", "op": ">=", "value": 15}
+    ]
+  },
+  {
+    "rule_id": "malware_c2_beacon",
+    "attack_type": "malware_c2",
+    "severity": "high",
+    "description": "Small periodic beacon-like connections: few connections, tightly clustered on one host/service, small payloads",
+    "conditions": [
+      {"field": "count", "op": "<=", "value": 8},
+      {"field": "dst_host_count", "op": "<=", "value": 15},
+      {"field": "dst_host_srv_count", "op": "<=", "value": 15},
+      {"field": "same_srv_rate", "op": ">=", "value": 0.85}
+    ]
+  },
+  {
+    "rule_id": "data_exfiltration_outbound",
+    "attack_type": "data_exfiltration",
+    "severity": "critical",
+    "description": "Large authenticated outbound transfer with minimal inbound response",
+    "conditions": [
+      {"field": "src_bytes", "op": ">=", "value": 50000},
+      {"field": "dst_bytes", "op": "<=", "value": 1000},
+      {"field": "logged_in", "op": "==", "value": 1}
+    ]
+  },
+  {
+    "rule_id": "malicious_download_inbound",
+    "attack_type": "malicious_download",
+    "severity": "high",
+    "description": "Large inbound transfer with minimal outbound request",
+    "conditions": [
+      {"field": "dst_bytes", "op": ">=", "value": 65000},
+      {"field": "src_bytes", "op": "<=", "value": 500}
+    ]
+  }
+]

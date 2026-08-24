@@ -1,0 +1,103 @@
+# Local dev stack for the Streaming IDS project: Kafka + ClickHouse + Superset.
+#
+# Everything the Spark app (running directly on your laptop, NOT in a
+# container — see spark_app/streaming_job.py) needs is exposed on
+# localhost, matching spark_app/config.py's defaults exactly:
+#   Kafka:      localhost:9092
+#   ClickHouse: localhost:8123 (HTTP/JDBC), localhost:9000 (native)
+#   Superset:   localhost:8088
+#
+# generate_traffic.py also runs on the laptop directly and connects to
+# localhost:9092 — nothing about the producer needs to change.
+#
+# Start everything:   docker compose up -d
+# Watch logs:          docker compose logs -f
+# Stop everything:     docker compose down
+# Stop + wipe data:    docker compose down -v
+
+services:
+  kafka:
+    image: apache/kafka:latest
+    container_name: ids-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # Single-node KRaft mode: no separate Zookeeper container needed.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # PLAINTEXT_HOST is what your laptop (outside Docker) connects to.
+      # PLAINTEXT is what other containers on the Docker network would use
+      # (not needed yet since Spark/generator run on the host, but kept in
+      # case a container ever needs to reach Kafka directly).
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:29093,PLAINTEXT_HOST://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://ids-kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@ids-kafka:29093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Lets generate_traffic.py's first produce() call create the
+      # "network-traffic" topic automatically — no manual topic-create step.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: ids-clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface — used by Spark's JDBC writer
+      - "9000:9000"   # native TCP protocol — used by CLI tools / clickhouse-connect
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      # Auto-runs on first startup only: creates the `ids` database that
+      # config.py already expects (CLICKHOUSE_DATABASE=ids).
+      - ./clickhouse-init:/docker-entrypoint-initdb.d
+    ulimits:
+      # ClickHouse's own docs recommend raising this; the container default
+      # is often too low and causes "too many open files" under load.
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  superset:
+    build: ./superset   # extends apache/superset with the ClickHouse driver — see superset/Dockerfile
+    container_name: ids-superset
+    ports:
+      - "8088:8088"
+    environment:
+      # Replace with a real random string before this is ever exposed
+      # beyond your own laptop — fine as a placeholder for local dev.
+      SUPERSET_SECRET_KEY: "replace-this-with-a-random-string-for-real-use"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - superset-data:/app/superset_home
+    # First-run bootstrap: migrate Superset's own metadata DB, create a
+    # default admin login, then start the web server. Safe to leave in
+    # place on later restarts — `db upgrade` and `create-admin` are both
+    # no-ops if already done.
+    command: >
+      /bin/sh -c "
+      superset db upgrade &&
+      superset fab create-admin --username admin --firstname Superset --lastname Admin --email admin@example.com --password admin &&
+      superset init &&
+      superset run -h 0.0.0.0 -p 8088
+      "
+
+volumes:
+  kafka-data:
+  clickhouse-data:
+  superset-data:
