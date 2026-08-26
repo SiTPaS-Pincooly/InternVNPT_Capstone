@@ -1,7 +1,27 @@
+# Streaming IDS — Python dependencies
+#
+# PySpark is PINNED, not floating. Three other things are locked to its
+# version and break in confusing ways if it moves underneath them:
+#
+#   1. Scala build      3.5.x is Scala 2.12; 4.x is Scala 2.13. Mixing them
+#                       gives NoSuchMethodError: scala.Predef$.wrapRefArray
+#                       at the moment Kafka is first read.
+#   2. Kafka connector  not bundled — supplied at submit time as
+#                       --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
+#                       Both the Scala suffix and the version must match exactly.
+#   3. Hadoop winutils  (Windows only) 3.5.x bundles Hadoop 3.3.4, so winutils
+#                       must be a 3.3.x build. Spark 4.x bundles Hadoop 3.4.x
+#                       and needs a 3.4.x build instead.
+#
+# Run `python tools/check_env.py` — it derives 2 and 3 from whatever PySpark
+# is actually installed, rather than trusting this comment.
+#
+# 3.5.1 is the version every test in this project was verified against.
+pyspark==3.5.1
+
 numpy>=1.24
+pandas>=2.0
+pyarrow>=4.0.0
 confluent-kafka>=2.3
 orjson>=3.9
-pyspark
-pandas
-pyarrow>=18.0.0
-clickhouse-connect
+clickhouse-connect>=0.7

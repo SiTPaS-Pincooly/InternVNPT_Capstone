@@ -43,7 +43,16 @@ CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "localhost")
 CLICKHOUSE_HTTP_PORT = int(os.environ.get("CLICKHOUSE_HTTP_PORT", "8123"))
 CLICKHOUSE_NATIVE_PORT = int(os.environ.get("CLICKHOUSE_NATIVE_PORT", "9000"))
 CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "default")
-CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
+# Must match CLICKHOUSE_PASSWORD in docker-compose.yml's clickhouse service.
+# It is not optional: since ClickHouse 25.1 the official image disables
+# network access for a passwordless `default` user, so an empty password here
+# produces "Code: 194 ... Authentication failed" on every write, even though
+# clickhouse-client inside the container connects fine. See the comment in
+# docker-compose.yml for the full explanation.
+#
+# Local dev credential only — override via the environment variable for any
+# deployment reachable beyond this laptop.
+CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "ids_local_dev")
 CLICKHOUSE_DATABASE = os.environ.get("CLICKHOUSE_DATABASE", "ids")
 CLICKHOUSE_TABLE = os.environ.get("CLICKHOUSE_TABLE", "detections")
 
@@ -72,3 +81,21 @@ CHECKPOINT_LOCATION = os.environ.get("CHECKPOINT_LOCATION", "./_checkpoints/stre
 # a predictable batch cadence, which is easier to reason about when you're
 # checking against the <2s detection latency target.
 TRIGGER_INTERVAL = os.environ.get("TRIGGER_INTERVAL", "1 second")
+
+# Hard ceiling on how many Kafka records a single micro-batch may consume.
+#
+# Without this, Structured Streaming reads ALL available offsets in the first
+# batch. That is fine on an idle topic and catastrophic on a backlog: the
+# whole backlog becomes one micro-batch, gets persisted, and is collected to
+# the driver by toPandas() in clickhouse_writer -> java.lang.OutOfMemoryError
+# in the stream execution thread. A backlog is easy to create by accident -
+# leave the producer running while the job is stopped, or restart the job
+# with an old checkpoint.
+#
+# It also protects the <2s latency target: an unbounded batch blows the
+# 1-second trigger interval no matter how fast the rules evaluate.
+#
+# 50,000 is ~3.4x the 14,880 rec/s demo cap, so steady-state batches are
+# never throttled by it; it only caps catch-up. Raise it when deliberately
+# measuring the throughput ceiling (see TESTING.md Stage 8).
+MAX_OFFSETS_PER_TRIGGER = os.environ.get("MAX_OFFSETS_PER_TRIGGER", "50000")

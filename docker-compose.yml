@@ -54,6 +54,26 @@ services:
     ports:
       - "8123:8123"   # HTTP interface — used by Spark's JDBC writer
       - "9000:9000"   # native TCP protocol — used by CLI tools / clickhouse-connect
+    environment:
+      # REQUIRED — do not remove. Since ClickHouse 25.1 the official image
+      # disables NETWORK access for the `default` user unless at least one of
+      # CLICKHOUSE_USER / CLICKHOUSE_PASSWORD / CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+      # is set, and writes a randomly generated password into
+      # /etc/clickhouse-server/users.d/default-password.xml.
+      #
+      # The failure this causes is confusing, because it is not symmetrical:
+      # `docker exec ids-clickhouse clickhouse-client` still works (that is a
+      # local connection, not a network one), while every network client —
+      # clickhouse_writer.py on port 8123, Superset, any GUI — fails with
+      #     Code: 194. DB::Exception: default: Authentication failed
+      # So the database looks healthy from the outside while nothing can
+      # actually write to it.
+      #
+      # Setting a password both enables network access and makes the
+      # credential explicit rather than randomly generated. This is a local
+      # dev value; override CLICKHOUSE_PASSWORD in the environment for any
+      # deployment that is reachable beyond this laptop.
+      CLICKHOUSE_PASSWORD: ids_local_dev
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       # Auto-runs on first startup only: creates the `ids` database that

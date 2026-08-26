@@ -350,40 +350,86 @@ def worker(worker_id: int, args: argparse.Namespace) -> None:
             "queue.buffering.max.kbytes": 1048576,
         })
 
+        # Fail fast if the broker is unreachable. Without this the producer
+        # happily buffers every message locally and reports success, because
+        # produce() is asynchronous - the first sign of trouble would be an
+        # empty Kafka topic and a Spark job that never sees a record.
+        try:
+            producer.list_topics(timeout=10)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot reach Kafka at {args.brokers}: {exc}\n"
+                "Is the stack up?   docker compose ps"
+            ) from exc
+
     sent = 0
     window_start = time.time()
     window_count = 0
     start = window_start
     deadline = start + args.duration_sec if args.duration_sec > 0 else None
 
-    while deadline is None or time.time() < deadline:
-        batch_start = time.time()
-        records = generate_batch(rng, args.batch_size, args.normal_ratio)
+    # produce() is fire-and-forget. Without a delivery callback a broker-side
+    # rejection is completely silent, and the worker reports every record as
+    # "sent" when none of them landed. These counters make generated vs
+    # actually-acknowledged visible.
+    stats = {"delivered": 0, "failed": 0}
 
+    def on_delivery(err, _msg):
+        if err is None:
+            stats["delivered"] += 1
+        else:
+            stats["failed"] += 1
+            if stats["failed"] <= 5:      # don't flood on a total outage
+                print(f"[worker {worker_id}] DELIVERY FAILED: {err}")
+
+    try:
+        while deadline is None or time.time() < deadline:
+            batch_start = time.time()
+            records = generate_batch(rng, args.batch_size, args.normal_ratio)
+
+            if producer is not None:
+                for rec in records:
+                    producer.produce(args.topic, value=dumps(rec),
+                                     callback=on_delivery)
+                producer.poll(0)
+            sent += len(records)
+            window_count += len(records)
+
+            # pace this worker toward its share of the target rate
+            elapsed = time.time() - batch_start
+            target_elapsed = args.batch_size / per_worker_target
+            if elapsed < target_elapsed:
+                time.sleep(target_elapsed - elapsed)
+
+            now = time.time()
+            if now - window_start >= 5:
+                rate = window_count / (now - window_start)
+                print(f"[worker {worker_id}] {rate:,.0f} records/sec "
+                      f"(generated: {sent:,}  delivered: {stats['delivered']:,})")
+                window_start = now
+                window_count = 0
+
+    except KeyboardInterrupt:
+        print(f"[worker {worker_id}] interrupted - flushing buffered messages")
+
+    finally:
+        # MUST run even on Ctrl+C. linger.ms=5 and batch.num.messages=10000
+        # mean up to ~10k records per worker are sitting in the client buffer
+        # at any moment; exiting without flushing silently discards them.
         if producer is not None:
-            for rec in records:
-                producer.produce(args.topic, value=dumps(rec))
-            producer.poll(0)
-        sent += len(records)
-        window_count += len(records)
+            remaining = producer.flush(30)
+            if remaining:
+                print(f"[worker {worker_id}] WARNING: {remaining:,} message(s) "
+                      "still unsent after a 30s flush - they were dropped.")
 
-        # pace this worker toward its share of the target rate
-        elapsed = time.time() - batch_start
-        target_elapsed = args.batch_size / per_worker_target
-        if elapsed < target_elapsed:
-            time.sleep(target_elapsed - elapsed)
-
-        now = time.time()
-        if now - window_start >= 5:
-            rate = window_count / (now - window_start)
-            print(f"[worker {worker_id}] {rate:,.0f} records/sec "
-                  f"(total sent: {sent:,})")
-            window_start = now
-            window_count = 0
-
-    if producer is not None:
-        producer.flush(30)
-    print(f"[worker {worker_id}] done. total records: {sent:,}")
+            print(f"[worker {worker_id}] done. generated: {sent:,}  "
+                  f"delivered: {stats['delivered']:,}  failed: {stats['failed']:,}")
+            if stats["delivered"] < sent:
+                print(f"[worker {worker_id}] WARNING: "
+                      f"{sent - stats['delivered']:,} record(s) never reached "
+                      "Kafka. Spark will not see them.")
+        else:
+            print(f"[worker {worker_id}] done. generated: {sent:,} (dry run)")
 
 
 def main() -> None:

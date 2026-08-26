@@ -46,11 +46,13 @@ Spark's internal batch time.
 
 from __future__ import annotations
 
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 import clickhouse_connect
+from pyspark import StorageLevel
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
@@ -226,7 +228,12 @@ def write_batch(batch_df: DataFrame, batch_id: int) -> dict[str, int]:
     including the malformed pseudo-labels, so streaming_job.py can log the
     malformed rate without triggering a second Spark action for it.
     """
-    batch_df.persist()
+    # MEMORY_AND_DISK, not the default MEMORY_ONLY: an oversized batch then
+    # spills to disk instead of pushing the driver into OutOfMemoryError.
+    # Slower in that case, but a slow batch is recoverable and a dead JVM
+    # is not. config.MAX_OFFSETS_PER_TRIGGER is the primary guard; this is
+    # the backstop.
+    batch_df.persist(StorageLevel.MEMORY_AND_DISK)
     try:
         client = get_client()
 
@@ -248,17 +255,142 @@ def write_batch(batch_df: DataFrame, batch_id: int) -> dict[str, int]:
 
 
 # --------------------------------------------------------------------------
-# Standalone sanity check - exercises the DataFrame prep logic (which
-# rows get kept, count aggregation) without requiring a live ClickHouse
-# connection, since this sandbox has no network path to one. The DDL
-# strings and an actual insert_df() round-trip still need to be verified
-# once against the real docker-compose stack on the laptop.
+# Standalone sanity check.
+#
+#   python spark_app/clickhouse_writer.py
+#       Offline. Exercises the DataFrame prep logic - which rows get kept,
+#       how counts aggregate - and prints the DDL. Needs no database.
+#
+#   python spark_app/clickhouse_writer.py --live
+#       Everything above, PLUS the real round-trip against a running
+#       ClickHouse: ensure_tables(), insert_df() into both tables, read the
+#       rows back, then delete them again. This is the one code path that
+#       cannot be verified without a server.
+#
+# The --live rows are tagged with batch_id = -1 (a value no real batch ever
+# uses) so they can be deleted afterwards without touching real data.
 # --------------------------------------------------------------------------
 
+TEST_BATCH_ID = -1
+
+
+def _live_round_trip(kept_pdf, counts_pdf) -> int:
+    """Insert the self-test fixture into a running ClickHouse, read it back,
+    then remove it. Returns 0 on success, non-zero on failure."""
+    print("\n" + "=" * 70)
+    print("LIVE ROUND-TRIP")
+    print("=" * 70)
+    print(f"host={config.CLICKHOUSE_HOST}:{config.CLICKHOUSE_HTTP_PORT} "
+          f"db={config.CLICKHOUSE_DATABASE} user={config.CLICKHOUSE_USER}")
+
+    try:
+        client = get_client()
+        client.command("SELECT 1")
+    except Exception as exc:
+        print(f"\nFAIL  cannot connect: {exc}")
+        print("      Is the stack up?   docker compose ps")
+        print("      Code 194 means the password in config.py does not match")
+        print("      CLICKHOUSE_PASSWORD in docker-compose.yml.")
+        return 2
+
+    print("  ok  connected")
+
+    try:
+        ensure_tables(client)
+        tables = {r[0] for r in client.query(
+            f"SHOW TABLES FROM {config.CLICKHOUSE_DATABASE}").result_rows}
+        print(f"  ok  ensure_tables() -> {sorted(tables)}")
+    except Exception as exc:
+        print(f"\nFAIL  ensure_tables(): {exc}")
+        return 3
+
+    # Re-tag the fixture so the cleanup below can find exactly these rows.
+    kept_pdf = kept_pdf.copy()
+    counts_pdf = counts_pdf.copy()
+    kept_pdf["batch_id"] = TEST_BATCH_ID
+    counts_pdf["batch_id"] = TEST_BATCH_ID
+
+    try:
+        client.insert_df(DETECTIONS_TABLE, kept_pdf)
+        print(f"  ok  insert_df({DETECTIONS_TABLE}) -> {len(kept_pdf)} rows")
+    except Exception as exc:
+        print(f"\nFAIL  insert_df({DETECTIONS_TABLE}): {exc}")
+        print("      Common causes: a NaN in a non-nullable Float64 column,")
+        print("      the timezone-aware processed_at vs DateTime64(3), or a")
+        print("      Python list not mapping onto Array(String).")
+        return 4
+
+    try:
+        client.insert_df(COUNTS_TABLE, counts_pdf)
+        print(f"  ok  insert_df({COUNTS_TABLE}) -> {len(counts_pdf)} rows")
+    except Exception as exc:
+        print(f"\nFAIL  insert_df({COUNTS_TABLE}): {exc}")
+        return 5
+
+    # Read back and check the values survived the trip intact - an insert
+    # that succeeds but mangles arrays or nulls is worse than one that fails.
+    det_back = client.query(
+        f"SELECT label, matched_rule_ids, max_severity, is_detection "
+        f"FROM {DETECTIONS_TABLE} WHERE batch_id = {TEST_BATCH_ID} ORDER BY label"
+    ).result_rows
+    cnt_back = client.query(
+        f"SELECT label, record_count FROM {COUNTS_TABLE} "
+        f"WHERE batch_id = {TEST_BATCH_ID} ORDER BY label"
+    ).result_rows
+
+    print(f"\n  read back from {DETECTIONS_TABLE}:")
+    for r in det_back:
+        print(f"    {r}")
+    print(f"  read back from {COUNTS_TABLE}:")
+    for r in cnt_back:
+        print(f"    {r}")
+
+    checks = [
+        (f"{DETECTIONS_TABLE} row count", len(det_back) == len(kept_pdf)),
+        (f"{COUNTS_TABLE} row count", len(cnt_back) == len(counts_pdf)),
+        ("Array(String) survived", any(isinstance(r[1], (list, tuple)) and r[1]
+                                       for r in det_back)),
+        ("Bool survived", all(isinstance(r[3], (bool, int)) for r in det_back)),
+    ]
+
+    print()
+    failed = 0
+    for name, ok in checks:
+        print(f"  {'ok  ' if ok else 'FAIL'}  {name}")
+        failed += 0 if ok else 1
+
+    # Clean up so the test fixture never pollutes real metrics.
+    try:
+        for table in (DETECTIONS_TABLE, COUNTS_TABLE):
+            client.command(
+                f"ALTER TABLE {table} DELETE WHERE batch_id = {TEST_BATCH_ID}")
+        print(f"\n  ok  cleanup: test rows (batch_id={TEST_BATCH_ID}) deleted")
+        print("      (ClickHouse mutations are async; they may take a moment "
+              "to disappear from SELECTs)")
+    except Exception as exc:
+        print(f"\n  warn  cleanup failed: {exc}")
+        print(f"        Remove manually: ALTER TABLE {DETECTIONS_TABLE} "
+              f"DELETE WHERE batch_id = {TEST_BATCH_ID}")
+
+    print("\n" + ("LIVE ROUND-TRIP PASSED" if not failed
+                  else f"{failed} CHECK(S) FAILED"))
+    return 1 if failed else 0
+
+
 if __name__ == "__main__":
+    import argparse
+
     from pyspark.sql import SparkSession
 
+    _parser = argparse.ArgumentParser(
+        description="Self-test for clickhouse_writer.py.")
+    _parser.add_argument(
+        "--live", action="store_true",
+        help="also insert into a running ClickHouse, read back, and clean up")
+    _args = _parser.parse_args()
+
     spark = SparkSession.builder.appName("clickhouse_writer_selftest").master("local[1]").getOrCreate()
+    spark.sparkContext.setLogLevel("ERROR")
 
     print("--- detections DDL ---")
     print(_detections_ddl())
@@ -300,5 +432,12 @@ if __name__ == "__main__":
     counts = _prepare_counts(df, batch_id=1)
     print("--- traffic_counts rows (denominator for FP rate later) ---")
     counts.select("label", "record_count", "batch_id").show(truncate=False)
+    counts_pdf = counts.toPandas()
 
     spark.stop()
+
+    if _args.live:
+        sys.exit(_live_round_trip(kept_pdf, counts_pdf))
+
+    print("\nOffline checks done. To test against a running ClickHouse:")
+    print("    python spark_app/clickhouse_writer.py --live")

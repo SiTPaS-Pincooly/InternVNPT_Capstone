@@ -395,11 +395,22 @@ def compile_rules(rules: Sequence[Rule]) -> dict[str, Column]:
         ])
     )
 
-    severity_expr = F.lit(None).cast("string")
-    for name in SEVERITY_ORDER:
-        severity_expr = F.when(max_rank == F.lit(_SEVERITY_RANK[name]), F.lit(name)).otherwise(
-            severity_expr
-        )
+    # Map rank -> name with a single lookup rather than a chain of when().
+    #
+    # The obvious `when(rank==4,"critical").otherwise(when(rank==3,...))` form
+    # inlines `max_rank` once PER LEVEL - and max_rank contains every rule's
+    # full predicate, so four levels means four more copies of all six rules.
+    # Catalyst does not CSE these; it walks the duplicated tree, and
+    # constraint propagation then compares the copies pairwise. That is what
+    # made the streaming query hang in Project.getAllValidConstraints.
+    #
+    # element_at is 1-based, so index = rank + 1: index 1 holds NULL for
+    # rank 0 (nothing matched), then low/medium/high/critical. max_rank now
+    # appears exactly once.
+    severity_expr = F.element_at(
+        F.array(F.lit(None).cast("string"), *[F.lit(s) for s in SEVERITY_ORDER]),
+        max_rank + F.lit(1),
+    )
 
     any_match = matches[0][1]
     for _, matched in matches[1:]:

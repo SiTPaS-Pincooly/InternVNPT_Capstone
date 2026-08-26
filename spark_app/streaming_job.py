@@ -77,10 +77,32 @@ COUNT_LABEL_COLUMN = "_count_label"
 
 
 def build_spark() -> SparkSession:
-    """Create the Spark session used by the streaming job."""
+    """Create the Spark session used by the streaming job.
+
+    `constraintPropagation` is disabled deliberately, and it is not a
+    micro-optimisation - without it this job HANGS.
+
+    The rules engine compiles six rules into one projection containing ~42
+    CASE WHEN and ~119 coalesce expressions. Catalyst's constraint
+    propagation walks that tree and compares every expression against every
+    other (ExpressionSet uses structural equality, so CaseWhen.equals
+    recurses through the whole subtree each time). ForeachBatchSink calls
+    LogicalRDD.fromDataset on every micro-batch, which triggers exactly that
+    computation - so each batch burned CPU in
+    Project.getAllValidConstraints and never completed. The stream stayed
+    "active", reported "Processing new data", and produced nothing.
+
+    Reproduced directly: calling .constraints() on this plan throws
+    OutOfMemoryError; with propagation disabled it returns in 6ms.
+
+    Constraint propagation only powers optimisations (filter inference,
+    null-ability pruning) that are worthless here - there are no joins and
+    no filters to push through - so disabling it costs nothing.
+    """
     spark = (
         SparkSession.builder
         .appName(config.SPARK_APP_NAME)
+        .config("spark.sql.constraintPropagation.enabled", "false")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -88,13 +110,21 @@ def build_spark() -> SparkSession:
 
 
 def build_kafka_stream(spark: SparkSession) -> DataFrame:
-    """Create the raw Kafka streaming DataFrame."""
+    """Create the raw Kafka streaming DataFrame.
+
+    `maxOffsetsPerTrigger` is not optional. Without it Structured Streaming
+    consumes every available offset in the first micro-batch; against a
+    backlog that becomes one enormous batch, which is persisted and then
+    collected to the driver by clickhouse_writer's toPandas() - an
+    OutOfMemoryError in the stream execution thread, not a slow batch.
+    """
     return (
         spark.readStream
         .format("kafka")
         .option("kafka.bootstrap.servers", config.KAFKA_BOOTSTRAP_SERVERS)
         .option("subscribe", config.KAFKA_TOPIC)
         .option("startingOffsets", config.KAFKA_STARTING_OFFSETS)
+        .option("maxOffsetsPerTrigger", config.MAX_OFFSETS_PER_TRIGGER)
         .load()
     )
 
@@ -158,6 +188,7 @@ def make_batch_writer(rules):
     malformed totals for the life of the process.
     """
     totals = {MALFORMED_UNPARSEABLE: 0, MALFORMED_INCOMPLETE: 0}
+    idle = {"count": 0}
 
     def process_batch(batch_df: DataFrame, batch_id: int) -> None:
         # Rules are evaluated over the whole batch, malformed rows included.
@@ -181,6 +212,7 @@ def make_batch_writer(rules):
         )
 
         if unparseable or incomplete:
+            idle["count"] = 0
             total_seen = valid + unparseable + incomplete
             LOGGER.warning(
                 "[batch %d] malformed: %d unparseable (transmission), "
@@ -191,9 +223,99 @@ def make_batch_writer(rules):
                 totals[MALFORMED_UNPARSEABLE], totals[MALFORMED_INCOMPLETE],
             )
         elif valid:
+            idle["count"] = 0
             LOGGER.info("[batch %d] %d records, none malformed", batch_id, valid)
+        else:
+            # Heartbeat. Without this an idle stream and a broken one look
+            # IDENTICAL in the log - both produce total silence - and there is
+            # no way to tell "connected, nothing to read" from "never started
+            # reading". Logged on the first idle batch and every 30th after,
+            # so a 1-second trigger doesn't flood the terminal.
+            idle["count"] += 1
+            if idle["count"] == 1 or idle["count"] % 30 == 0:
+                LOGGER.info(
+                    "[batch %d] idle - no records for %d batch(es). "
+                    "topic=%s offsets=%s. If this never changes: the topic may "
+                    "be empty, or offsets=latest is skipping existing records "
+                    "(clear %s to re-read with offsets=earliest).",
+                    batch_id, idle["count"], config.KAFKA_TOPIC,
+                    config.KAFKA_STARTING_OFFSETS, config.CHECKPOINT_LOCATION,
+                )
 
     return process_batch
+
+
+def _await_with_progress(query, poll_seconds: int = 10) -> None:
+    """Block on the query, logging Spark's own progress report periodically.
+
+    `query.awaitTermination()` on its own is a black box: if Spark never
+    completes a batch, foreachBatch is never invoked, so no application
+    logging happens at all and a stalled query is indistinguishable from an
+    idle one. `lastProgress` is Spark's own account of what it read - the
+    Kafka offsets it resolved, how many rows it pulled, how long the trigger
+    took - which is the difference between diagnosing this and guessing.
+    """
+    waited = 0
+    while query.isActive:
+        if query.awaitTermination(poll_seconds):
+            return
+        waited += poll_seconds
+
+        progress = query.lastProgress
+        if progress is None:
+            # `status` is populated immediately and says what the query is
+            # doing right now - "Getting offsets from KafkaV2[...]",
+            # "Processing new data", "Waiting for data to arrive". That
+            # distinguishes a slow first batch from a stuck one, which
+            # lastProgress alone cannot.
+            status = query.status or {}
+            LOGGER.info(
+                "no completed batch yet after %ds | status=%r "
+                "dataAvailable=%s triggerActive=%s",
+                waited,
+                status.get("message"),
+                status.get("isDataAvailable"),
+                status.get("isTriggerActive"),
+            )
+            # The first batch reads up to MAX_OFFSETS_PER_TRIGGER records and
+            # ends with a ClickHouse insert, so tens of seconds is normal.
+            # Only past a minute is this genuinely suspicious.
+            if waited >= 60:
+                LOGGER.warning(
+                    "Still no completed batch after %ds. If status is stuck on "
+                    "getting offsets, Spark's JVM cannot reach the broker at "
+                    "%s (the Python producer using the same address proves the "
+                    "broker is up, not that this JVM can reach it). See "
+                    "http://localhost:4040 -> Structured Streaming.",
+                    waited, config.KAFKA_BOOTSTRAP_SERVERS,
+                )
+            continue
+
+        waited = 0
+
+        sources = progress.get("sources") or [{}]
+        src = sources[0]
+        LOGGER.info(
+            "progress: batch=%s inputRows=%s rate=%.1f/s trigger=%sms | "
+            "kafka start=%s end=%s",
+            progress.get("batchId"),
+            progress.get("numInputRows"),
+            progress.get("inputRowsPerSecond") or 0.0,
+            (progress.get("durationMs") or {}).get("triggerExecution"),
+            src.get("startOffset"),
+            src.get("endOffset"),
+        )
+
+        # numInputRows == 0 while the topic demonstrably has data means the
+        # offsets Spark resolved are already at the end of the topic - almost
+        # always a checkpoint that outlived a startingOffsets change.
+        if progress.get("numInputRows") == 0 and src.get("endOffset"):
+            LOGGER.info(
+                "  (0 rows: Spark's committed offset is at endOffset. With "
+                "offsets=%s, delete %s and restart to re-read from the "
+                "beginning.)",
+                config.KAFKA_STARTING_OFFSETS, config.CHECKPOINT_LOCATION,
+            )
 
 
 def main() -> None:
@@ -233,13 +355,16 @@ def main() -> None:
         )
 
         LOGGER.info(
-            "Streaming IDS started: topic=%s, offsets=%s, trigger=%s",
+            "Streaming IDS started: topic=%s, offsets=%s, trigger=%s, "
+            "maxOffsetsPerTrigger=%s",
             config.KAFKA_TOPIC,
             config.KAFKA_STARTING_OFFSETS,
             config.TRIGGER_INTERVAL,
+            config.MAX_OFFSETS_PER_TRIGGER,
         )
+        LOGGER.info("Spark UI (Structured Streaming tab): http://localhost:4040")
 
-        query.awaitTermination()
+        _await_with_progress(query)
 
     except KeyboardInterrupt:
         LOGGER.info("Stopping Streaming IDS")
