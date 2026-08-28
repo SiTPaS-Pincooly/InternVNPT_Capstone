@@ -340,6 +340,9 @@ def main() -> None:
         )
         clickhouse_writer.ensure_tables()
         LOGGER.info("ClickHouse tables are ready")
+        if config.RESET_CLICKHOUSE_ON_START:
+            clickhouse_writer.reset_runtime_data()
+            LOGGER.info("ClickHouse runtime data reset; dashboard starts from zero")
 
         kafka_df = build_kafka_stream(spark)
         parsed_df = parse_messages(kafka_df)

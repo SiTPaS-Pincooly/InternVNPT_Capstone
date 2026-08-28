@@ -37,8 +37,8 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      # Lets generate_traffic.py's first produce() call create the
-      # "network-traffic" topic automatically — no manual topic-create step.
+      # The kafka-init service below creates the topic explicitly before Spark
+      # starts. Keep auto-create enabled as a fallback for ad-hoc producers.
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     volumes:
       - kafka-data:/var/lib/kafka/data
@@ -47,6 +47,24 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
+
+  kafka-init:
+    image: apache/kafka:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - /opt/kafka/bin/kafka-topics.sh
+      - --bootstrap-server
+      - kafka:29092
+      - --create
+      - --if-not-exists
+      - --topic
+      - network-traffic
+      - --partitions
+      - "1"
+      - --replication-factor
+      - "1"
 
   clickhouse:
     image: clickhouse/clickhouse-server:latest

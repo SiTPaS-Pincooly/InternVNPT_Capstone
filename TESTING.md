@@ -361,6 +361,73 @@ spark-submit \
 
 > **Order matters.** Streaming job first, producer second. With `latest` offsets, starting the producer first means those records are simply never seen.
 
+### Repeatable dashboard run
+
+By default, every new `streaming_job.py` process runs `TRUNCATE TABLE` on
+`ids.detections` and `ids.traffic_counts` after ensuring the tables exist.
+Superset metadata, database connections and datasets are not removed, so
+refreshing the dashboard starts from zero. Stop any previous Spark job before
+starting a new one; otherwise the old process can continue writing rows after
+the reset.
+
+Use this sequence for each demo run, from the repository root:
+
+```powershell
+# terminal A — infrastructure (first run may build Superset for a while)
+docker compose up -d
+docker compose ps
+# kafka-init must show Exited (0) before continuing
+docker compose ps -a kafka-init
+docker exec ids-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list
+docker exec ids-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic network-traffic
+
+# terminal B — Spark; startup log must include the runtime-data reset message
+spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 --driver-memory 4g spark_app/streaming_job.py
+
+# terminal C — generate a finite run; Ctrl+C also flushes buffered records
+python producer/generate_traffic.py --workers 1 --target-rate 14880 --duration-sec 60
+
+# optional: inspect the two tables after the producer finishes
+docker exec ids-clickhouse clickhouse-client --query \
+  "SELECT 'detections' AS table_name, count() FROM ids.detections UNION ALL SELECT 'traffic_counts', count() FROM ids.traffic_counts"
+```
+
+Open `http://localhost:8088`, log in with `admin` / `admin`, and refresh the
+dashboard after records arrive. Leave the Spark terminal running if the stream
+should continue processing; press `Ctrl+C` there when the run is complete.
+
+The reset is enabled by `RESET_CLICKHOUSE_ON_START=true` (the default). To
+restart Spark without clearing existing dashboard data:
+
+```powershell
+$env:RESET_CLICKHOUSE_ON_START = "false"
+```
+
+If a genuinely fresh Kafka replay is required too, stop Spark and remove the
+checkpoint before restarting. This changes the Kafka read position and is
+separate from clearing ClickHouse:
+
+```powershell
+Remove-Item -Recurse -Force _checkpoints/streaming_job
+$env:KAFKA_STARTING_OFFSETS = "earliest"
+```
+
+If Spark reports that partitions are gone, the topic was deleted/recreated or
+its partition count changed while the old checkpoint remained. For this
+single-partition experiment, stop Spark, delete and recreate the topic, then
+remove the old checkpoint before starting Spark again:
+
+```powershell
+docker exec ids-kafka /opt/kafka/bin/kafka-topics.sh `
+  --bootstrap-server localhost:9092 `
+  --delete --topic network-traffic
+docker compose up -d kafka-init
+Remove-Item -Recurse -Force _checkpoints/streaming_job -ErrorAction SilentlyContinue
+$env:KAFKA_STARTING_OFFSETS = "latest"
+```
+
 ```bash
 # terminal A — leave running from Stage 4
 spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 --driver-memory 4g spark_app/streaming_job.py

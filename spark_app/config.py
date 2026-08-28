@@ -56,6 +56,13 @@ CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "ids_local_dev")
 CLICKHOUSE_DATABASE = os.environ.get("CLICKHOUSE_DATABASE", "ids")
 CLICKHOUSE_TABLE = os.environ.get("CLICKHOUSE_TABLE", "detections")
 
+# Clear runtime data before every new streaming-job process. Superset keeps
+# its metadata separately, so this resets dashboard numbers without removing
+# database connections or datasets.
+RESET_CLICKHOUSE_ON_START = os.environ.get(
+    "RESET_CLICKHOUSE_ON_START", "true"
+).lower() in {"1", "true", "yes", "on"}
+
 # JDBC URL Spark's foreachBatch writer connects through.
 CLICKHOUSE_JDBC_URL = (
     f"jdbc:clickhouse://{CLICKHOUSE_HOST}:{CLICKHOUSE_HTTP_PORT}/{CLICKHOUSE_DATABASE}"

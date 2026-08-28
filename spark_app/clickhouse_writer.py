@@ -143,6 +143,13 @@ def ensure_tables(client=None) -> None:
     client.command(_counts_ddl())
 
 
+def reset_runtime_data(client=None) -> None:
+    """Remove all rows used by the dashboard while keeping its schema."""
+    client = client or get_client()
+    for table in (DETECTIONS_TABLE, COUNTS_TABLE):
+        client.command(f"TRUNCATE TABLE {table}")
+
+
 # --------------------------------------------------------------------------
 # Per-batch write logic (the foreachBatch function)
 # --------------------------------------------------------------------------
